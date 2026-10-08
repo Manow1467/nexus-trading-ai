@@ -6,7 +6,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
-app = FastAPI(title="Nexus Trading AI", version="1.0.0")
+app = FastAPI(title="Nexus Trading AI", version="1.1.0")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 
 MODE = os.getenv("TRADING_MODE", "paper")
@@ -18,13 +18,7 @@ state: Dict[str, Any] = {
     "positions": [],
     "last_signal": None,
     "events": [],
-}
-
-SYMBOLS = {
-    "BTCUSD": {"id": "bitcoin", "fallback": 65000.0},
-    "ETHUSD": {"id": "ethereum", "fallback": 2500.0},
-    "XAUUSD": {"id": None, "fallback": 2650.0},
-    "EURUSD": {"id": None, "fallback": 1.17},
+    "last_prices": {},
 }
 
 def now():
@@ -32,50 +26,97 @@ def now():
 
 def log(message):
     state["events"].insert(0, {"time": now(), "message": message})
-    state["events"] = state["events"][:30]
+    state["events"] = state["events"][:40]
 
-def price_for(symbol: str):
-    meta = SYMBOLS[symbol]
-    if not meta["id"]:
-        return meta["fallback"], 0.0, "fallback adapter"
+def get_json(url, params=None):
+    r = requests.get(url, params=params, timeout=8, headers={"User-Agent": "NexusTradingAI/1.1"})
+    r.raise_for_status()
+    return r.json()
+
+def crypto_quote(symbol: str):
+    binance_symbol = symbol.replace("USD", "USDT")
     try:
-        r = requests.get(
-            "https://api.coingecko.com/api/v3/simple/price",
-            params={"ids": meta["id"], "vs_currencies": "usd", "include_24hr_change": "true"},
-            timeout=6,
-        )
-        r.raise_for_status()
-        d = r.json().get(meta["id"], {})
-        price = float(d.get("usd", meta["fallback"]))
-        change = float(d.get("usd_24h_change", 0.0))
-        return price, change, "CoinGecko"
+        d = get_json("https://api.binance.com/api/v3/ticker/24hr", {"symbol": binance_symbol})
+        return float(d["lastPrice"]), float(d["priceChangePercent"]), "Binance spot", "fresh"
     except Exception:
-        return meta["fallback"], 0.0, "fallback"
+        coin = {"BTCUSD": "bitcoin", "ETHUSD": "ethereum"}[symbol]
+        try:
+            d = get_json(
+                "https://api.coingecko.com/api/v3/simple/price",
+                {"ids": coin, "vs_currencies": "usd", "include_24hr_change": "true"},
+            )[coin]
+            return float(d["usd"]), float(d.get("usd_24h_change") or 0.0), "CoinGecko", "fresh"
+        except Exception as exc:
+            raise RuntimeError(f"Crypto market data unavailable: {exc}")
+
+def gold_quote():
+    d = get_json("https://xaus.com/api/v1/spot", {"currency": "USD", "unit": "oz", "compact": "1"})
+    data_state = d.get("data_state", {})
+    status = data_state.get("status", "unknown")
+    price = float(d["spot_usd_oz"])
+    change = 0.0
+    try:
+        intraday = get_json("https://xaus.com/api/v1/intraday", {"symbol": "xau", "hours": "24"})
+        points = intraday.get("points") or []
+        if len(points) >= 2:
+            first = float(points[0]["p"])
+            last = float(points[-1]["p"])
+            if first:
+                change = (last - first) / first * 100.0
+    except Exception:
+        pass
+    return price, change, "XAUS XAU/USD spot", status
+
+def eurusd_quote():
+    d = get_json("https://xaus.com/api/v1/spot", {"currency": "EUR", "unit": "oz", "compact": "1"})
+    eur_gold = float(d["xau"]["price"])
+    usd_gold = float(d["spot_usd_oz"])
+    if not eur_gold:
+        raise RuntimeError("EUR reference feed returned zero")
+    eurusd = usd_gold / eur_gold
+    status = "stale" if d.get("fx_stale") else d.get("data_state", {}).get("status", "fresh")
+    return eurusd, 0.0, "XAUS FX reference", status
+
+def quote(symbol: str):
+    if symbol in ("BTCUSD", "ETHUSD"):
+        return crypto_quote(symbol)
+    if symbol == "XAUUSD":
+        return gold_quote()
+    return eurusd_quote()
 
 def analyze(symbol: str):
-    price, change, source = price_for(symbol)
-    trend = 50 + max(-20, min(20, change * 1.5))
-    momentum = 50 + max(-20, min(20, change * 1.2))
-    volatility = 70 if abs(change) < 4 else 48
-    score = round(0.45 * trend + 0.35 * momentum + 0.20 * volatility, 1)
+    price, change, source, data_status = quote(symbol)
+    trend = max(0.0, min(100.0, 50.0 + change * 1.5))
+    momentum = max(0.0, min(100.0, 50.0 + change * 1.2))
+    quality = 82.0 if data_status == "fresh" else 62.0
+    score = round(0.45 * trend + 0.35 * momentum + 0.20 * quality, 1)
     direction = "BUY" if change > 0.35 else "SELL" if change < -0.35 else "HOLD"
-    if score < 72:
+    if data_status != "fresh" or score < 72:
         direction = "HOLD"
     confidence = min(99, max(20, round(score)))
     reasons = [
-        f"24h momentum: {change:+.2f}%",
+        f"24h / recent momentum: {change:+.2f}%",
         f"Trend component: {trend:.1f}/100",
         f"Momentum component: {momentum:.1f}/100",
-        f"Volatility quality: {volatility:.1f}/100",
+        f"Data quality: {quality:.1f}/100",
     ]
-    if source != "CoinGecko":
-        reasons.append("Using safe fallback because a live adapter is unavailable.")
+    if data_status != "fresh":
+        reasons.append(f"Feed status: {data_status}. Entry blocked until a fresh quote is available.")
+    else:
+        reasons.append("Fresh public market reference feed is available.")
     signal = {
-        "symbol": symbol, "price": round(price, 6), "direction": direction,
-        "score": score, "confidence": confidence, "source": source,
-        "reasons": reasons, "time": now(),
+        "symbol": symbol,
+        "price": round(price, 6),
+        "direction": direction,
+        "score": score,
+        "confidence": confidence,
+        "source": source,
+        "data_status": data_status,
+        "reasons": reasons,
+        "time": now(),
     }
     state["last_signal"] = signal
+    state["last_prices"][symbol] = price
     return signal
 
 @app.get("/", response_class=HTMLResponse)
@@ -85,7 +126,13 @@ def home():
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "mode": MODE, "live_trading_enabled": LIVE, "time": now()}
+    return {
+        "ok": True,
+        "mode": MODE,
+        "live_trading_enabled": LIVE,
+        "time": now(),
+        "symbols": ["BTCUSD", "ETHUSD", "XAUUSD", "EURUSD"],
+    }
 
 @app.get("/api/state")
 def get_state():
@@ -103,24 +150,38 @@ def get_state():
 @app.get("/api/analyze/{symbol}")
 def analyze_api(symbol: str):
     symbol = symbol.upper()
-    if symbol not in SYMBOLS:
+    if symbol not in {"BTCUSD", "ETHUSD", "XAUUSD", "EURUSD"}:
         raise HTTPException(404, "Unsupported symbol")
     with lock:
-        signal = analyze(symbol)
-        log(f"{symbol}: {signal['direction']} | score {signal['score']}")
-        return signal
+        try:
+            signal = analyze(symbol)
+            log(f"{symbol}: {signal['direction']} | score {signal['score']} | {signal['source']}")
+            return signal
+        except Exception as exc:
+            log(f"{symbol}: data feed error handled safely")
+            return {
+                "symbol": symbol,
+                "price": None,
+                "direction": "HOLD",
+                "score": 0,
+                "confidence": 0,
+                "source": "unavailable",
+                "data_status": "unavailable",
+                "reasons": [f"No trusted market quote is available right now. Entry is disabled. ({exc})"],
+                "time": now(),
+            }
 
 @app.post("/api/execute/{symbol}")
 def execute(symbol: str):
     symbol = symbol.upper()
-    if symbol not in SYMBOLS:
+    if symbol not in {"BTCUSD", "ETHUSD", "XAUUSD", "EURUSD"}:
         raise HTTPException(404, "Unsupported symbol")
     with lock:
         if state["kill_switch"]:
             raise HTTPException(409, "Kill switch is active")
         signal = analyze(symbol)
-        if signal["direction"] == "HOLD" or signal["score"] < 72:
-            raise HTTPException(409, "Entry gate says HOLD")
+        if signal["data_status"] != "fresh" or signal["direction"] == "HOLD" or signal["score"] < 72:
+            raise HTTPException(409, "Entry gate blocked this trade")
         if state["positions"]:
             raise HTTPException(409, "Maximum demo position count reached")
         risk_cash = round(state["balance"] * 0.005, 2)
@@ -142,7 +203,10 @@ def close():
         if not state["positions"]:
             raise HTTPException(409, "No open position")
         pos = state["positions"].pop(0)
-        price, _, _ = price_for(pos["symbol"])
+        try:
+            price, _, _, _ = quote(pos["symbol"])
+        except Exception:
+            price = pos["entry"]
         move = ((price - pos["entry"]) / pos["entry"]) if pos["side"] == "BUY" else ((pos["entry"] - price) / pos["entry"])
         pnl = round(pos["risk"] * move * 20, 2)
         state["balance"] = round(state["balance"] + pnl, 2)
